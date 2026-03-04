@@ -1,108 +1,92 @@
-"""HTS 线圈 Ic 估计流程。
-
-该模块提供 ``estimate_coil_critical_current``，把电磁场计算与 Jc 预测模型连接起来，
-形成可扩展的数据流：
-
-1. 给定候选电流 I；
-2. 计算每段局部磁场；
-3. 组装模型特征 [T, B_mag, B_parallel, B_perpendicular]；
-4. 调用 jc_model.predict 获取局部 Jc；
-5. 按“最弱段”准则（默认）或占位 E-I 准则估计线圈 Ic。
-
-后续可直接替换 jc_model 为深度学习模型，无需改动电磁求解部分。
-"""
-
 from __future__ import annotations
 
-from typing import Callable, Literal
+from dataclasses import dataclass
 
-import numpy as np
-
+from .field import biot_savart_field
+from .frames import decompose_B
+from .geometry import PancakeCoilSpec
 from .jc_interface import JcModel
+from .segments import build_current_elements, discretize_turns
+from .utils import Vec3
 
-Criterion = Literal["weakest_segment", "ei_placeholder"]
+
+@dataclass
+class SegmentEvaluation:
+    position: Vec3
+    turn_index: int
+    width_index: int
+    theta_index: int
+    Bxyz: Vec3
+    B_mag: float
+    B_parallel: float
+    B_perpendicular: float
+    theta: float
+    Jc: float
+    Ic_local: float
+
+
+def evaluate_segments(
+    coil: PancakeCoilSpec,
+    total_current: float,
+    temperature: float,
+    jc_model: JcModel,
+    n_theta: int = 180,
+    n_width: int = 5,
+) -> list[SegmentEvaluation]:
+    segments = discretize_turns(coil, total_current, n_theta=n_theta, n_width=n_width)
+    src_pos, src_dls, src_I = build_current_elements(segments)
+    B_all = biot_savart_field(src_pos, src_pos, src_dls, src_I)
+
+    features: list[list[float]] = []
+    raw_components: list[tuple[float, float, float, float]] = []
+    for seg, B in zip(segments, B_all):
+        B_mag, B_par, B_perp, theta = decompose_B(B, seg.e_t, seg.e_w, seg.e_n)
+        features.append([temperature, B_mag, B_par, B_perp])
+        raw_components.append((B_mag, B_par, B_perp, theta))
+
+    Jc = jc_model.predict(features)
+    if len(Jc) != len(segments):
+        raise ValueError("jc_model.predict must return same length as features")
+
+    lane_width = coil.tape.width / n_width
+    effective_area = lane_width * 1.0  # placeholder (thin-tape interface)
+    Ic_local = [jc * effective_area for jc in Jc]
+
+    out: list[SegmentEvaluation] = []
+    for i, seg in enumerate(segments):
+        B_mag, B_par, B_perp, theta = raw_components[i]
+        out.append(
+            SegmentEvaluation(
+                position=seg.position,
+                turn_index=seg.turn_index,
+                width_index=seg.width_index,
+                theta_index=seg.theta_index,
+                Bxyz=B_all[i],
+                B_mag=B_mag,
+                B_parallel=B_par,
+                B_perpendicular=B_perp,
+                theta=theta,
+                Jc=float(Jc[i]),
+                Ic_local=float(Ic_local[i]),
+            )
+        )
+    return out
 
 
 def estimate_coil_critical_current(
-    current_candidates: np.ndarray,
+    coil: PancakeCoilSpec,
     temperature: float,
-    segment_area: np.ndarray,
-    field_solver: Callable[[float], np.ndarray],
     jc_model: JcModel,
-    criterion: Criterion = "weakest_segment",
-    e_criterion_threshold: float = 1.0,
+    n_theta: int = 180,
+    n_width: int = 5,
+    current_guess: float = 100.0,
 ) -> float:
-    """估计线圈临界电流 Ic。
-
-    Args:
-        current_candidates: 候选电流序列（A），建议单调递增。
-        temperature: 线圈温度（K），当前实现假设各段一致。
-        segment_area: 每段截面积数组（m²），形状为 ``(n_segments,)``。
-        field_solver: 电磁场求解函数，输入候选电流 I（A），输出
-            形状 ``(n_segments, 3)`` 的磁场分量 ``[B_mag, B_parallel, B_perpendicular]``（T）。
-        jc_model: 满足 ``JcModel`` 接口的预测模型。
-        criterion: 估计准则。
-            - ``weakest_segment``：当任一段 ``I > Ic_local`` 时视为超限。
-            - ``ei_placeholder``：E-I 判据占位实现，当前基于超限比例的简化指标。
-        e_criterion_threshold: E-I 占位准则阈值，指标超过该值视为失超。
-
-    Returns:
-        估计得到的线圈临界电流 Ic（A）。
-
-    Raises:
-        ValueError: 输入维度错误或候选电流为空时抛出。
-    """
-    currents = np.asarray(current_candidates, dtype=float).reshape(-1)
-    if currents.size == 0:
-        raise ValueError("current_candidates must not be empty.")
-
-    area = np.asarray(segment_area, dtype=float).reshape(-1)
-    if area.ndim != 1 or area.size == 0:
-        raise ValueError("segment_area must be a non-empty 1D array.")
-    if np.any(area <= 0):
-        raise ValueError("segment_area must contain strictly positive values.")
-
-    last_safe_current = currents[0]
-
-    for i_candidate in currents:
-        local_b = np.asarray(field_solver(float(i_candidate)), dtype=float)
-        if local_b.ndim != 2 or local_b.shape[1] != 3:
-            raise ValueError(
-                "field_solver must return shape (n_segments, 3) as "
-                "[B_mag, B_parallel, B_perpendicular]."
-            )
-        if local_b.shape[0] != area.size:
-            raise ValueError(
-                "field_solver output segment count must match segment_area length."
-            )
-
-        features = np.column_stack(
-            (
-                np.full((area.size,), float(temperature), dtype=float),
-                local_b,
-            )
-        )
-
-        local_jc = np.asarray(jc_model.predict(features), dtype=float).reshape(-1)
-        if local_jc.size != area.size:
-            raise ValueError("jc_model.predict must return one Jc value per segment.")
-        if np.any(local_jc <= 0):
-            raise ValueError("jc_model.predict must return strictly positive Jc values.")
-
-        local_ic = local_jc * area
-
-        if criterion == "weakest_segment":
-            passed = bool(np.all(i_candidate <= local_ic))
-        elif criterion == "ei_placeholder":
-            overload_ratio = np.maximum(i_candidate / local_ic - 1.0, 0.0)
-            indicator = float(np.mean(overload_ratio))
-            passed = indicator <= float(e_criterion_threshold)
-        else:
-            raise ValueError(f"Unsupported criterion: {criterion}")
-
-        if passed:
-            last_safe_current = i_candidate
-        else:
-            break
-
-    return float(last_safe_current)
+    results = evaluate_segments(
+        coil=coil,
+        total_current=current_guess,
+        temperature=temperature,
+        jc_model=jc_model,
+        n_theta=n_theta,
+        n_width=n_width,
+    )
+    return min(r.Ic_local for r in results)
